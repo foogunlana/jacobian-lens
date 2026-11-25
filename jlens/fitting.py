@@ -283,6 +283,7 @@ def fit(
             The result is still a :class:`JacobianLens` (so ``save``, ``load``
             and ``merge`` work), but ``apply``/``transport`` are meaningless
             on it: each matrix maps to layer ``l + 1``, not the final layer.
+            Tested in ``tests/test_layerwise.py``.
 
     Returns:
         The fitted :class:`JacobianLens`.

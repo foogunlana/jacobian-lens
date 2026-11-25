@@ -35,6 +35,7 @@ class ActivationRecorder:
             graph now runs only from ``leaves[k - 1]`` to ``activations[k]``,
             so gradients give single-block Jacobians. Can't be combined with
             ``start_graph_at``.
+            Tested in ``tests/test_layerwise.py``.
     """
 
     def __init__(

@@ -88,16 +88,22 @@ hops.save("out/hops.pt")   # hops.jacobians[l] is A_l; don't use .apply() on it
 `A_{n-2} @ ... @ A_l` is not exactly `J_l` on a real model: each `A_l` is
 already summed over positions and averaged over text, so cross-position paths
 and context dependence are lost. Multiplying the full per-position block
-Jacobians before collapsing does give `J_l` exactly; see
-`tests/test_layerwise_qwen.py`.
+Jacobians before collapsing does give `J_l` exactly. Both are checked in
+`tests/test_layerwise.py`.
 
 ## Tests
 
+All tests run on the CPU with small models built in the test files (no
+downloads), in about 10 seconds:
+
 ```bash
 pip install -e ".[dev]"
-pytest tests                              # everything, CPU, ~10 s
-pytest tests/test_layerwise_qwen.py -v    # layerwise checks on a tiny random Qwen3 (no download)
+pytest tests                          # everything
+pytest tests/test_layerwise.py -v     # just the layerwise fit, one line per check
 ```
+
+`tests/test_layerwise.py` starts with a short description of what each check
+covers.
 
 ## Walkthrough
 
