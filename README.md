@@ -73,6 +73,32 @@ reference implementation and is not optimized; fitting time is dominated by
 the model's own backward pass. Parallelize by running `fit()` on disjoint
 slices and combining with `JacobianLens.merge()`.
 
+### Layerwise (single-block) Jacobians
+
+This fork adds `layerwise=True`: instead of `J_l = dh_final / dh_l`, fit each
+block's own Jacobian `A_l = dh_{l+1} / dh_l`, for every `l` in one fit (the
+residual stream is cut after every block, so one set of backward passes gives
+all hops). Same estimator, prompts and positions as the regular fit.
+
+```python
+hops = jlens.fit(model, prompts=my_prompts, layerwise=True, checkpoint_path="out/hops.pt")
+hops.save("out/hops.pt")   # hops.jacobians[l] is A_l; don't use .apply() on it
+```
+
+`A_{n-2} @ ... @ A_l` is not exactly `J_l` on a real model: each `A_l` is
+already summed over positions and averaged over text, so cross-position paths
+and context dependence are lost. Multiplying the full per-position block
+Jacobians before collapsing does give `J_l` exactly; see
+`tests/test_layerwise_qwen.py`.
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest tests                              # everything, CPU, ~10 s
+pytest tests/test_layerwise_qwen.py -v    # layerwise checks on a tiny random Qwen3 (no download)
+```
+
 ## Walkthrough
 
 [`walkthrough.ipynb`](walkthrough.ipynb) is the end-to-end notebook: load a
