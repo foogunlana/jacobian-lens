@@ -252,6 +252,7 @@ def fit(
     checkpoint_path: str | None = None,
     checkpoint_every: int | None = 1,
     resume: bool = True,
+    layerwise: bool = False,
 ) -> JacobianLens:
     """Fit ``J_l`` over a list of prompts and return a :class:`JacobianLens`.
 
@@ -276,10 +277,18 @@ def fit(
             checkpoint can be large (``len(source_layers) * d_model**2 * 4``
             bytes), so raise this for large models.
         resume: If ``True`` and ``checkpoint_path`` exists, resume from it.
+        layerwise: If ``True``, fit single-block Jacobians
+            ``A_l = dh_{l+1} / dh_l`` instead of ``J_l`` (see
+            :func:`jacobian_for_prompt`). ``target_layer`` must be ``None``.
+            The result is still a :class:`JacobianLens` (so ``save``, ``load``
+            and ``merge`` work), but ``apply``/``transport`` are meaningless
+            on it: each matrix maps to layer ``l + 1``, not the final layer.
 
     Returns:
         The fitted :class:`JacobianLens`.
     """
+    if layerwise and target_layer is not None:
+        raise ValueError("layerwise targets l + 1 for each source l; don't pass target_layer")
     n_layers, d_model = model.n_layers, model.d_model
     source_layers, target_layer = _check_layer_indices(
         source_layers, target_layer, n_layers
@@ -287,11 +296,11 @@ def fit(
 
     logger.info(
         "fit: n_layers=%d d_model=%d, fitting %d source layers "
-        "(target=L%d) on %d prompts",
+        "(target=%s) on %d prompts",
         n_layers,
         d_model,
         len(source_layers),
-        target_layer,
+        "l+1, layerwise" if layerwise else f"L{target_layer}",
         len(prompts),
     )
 
@@ -313,6 +322,13 @@ def fit(
                     f"checkpoint at {checkpoint_path} was fitted with {key}="
                     f"{state[key]!r}, not {expected!r}; pass resume=False to discard it"
                 )
+        # Older checkpoints have no "layerwise" key: they hold J_l, not hops.
+        if state.get("layerwise", False) != layerwise:
+            raise ValueError(
+                f"checkpoint at {checkpoint_path} was fitted with layerwise="
+                f"{state.get('layerwise', False)!r}, not {layerwise!r}; "
+                "pass resume=False to discard it"
+            )
         jacobian_sum, n_done, next_idx = (
             state["jacobian_sum"],
             state["n_done"],
@@ -341,6 +357,7 @@ def fit(
                     "source_layers": source_layers,
                     "target_layer": target_layer,
                     "skip_first": skip_first,
+                    "layerwise": layerwise,
                 },
                 checkpoint_path,
             )
@@ -355,10 +372,11 @@ def fit(
                 model,
                 prompt,
                 source_layers,
-                target_layer=target_layer,
+                target_layer=None if layerwise else target_layer,
                 dim_batch=dim_batch,
                 max_seq_len=max_seq_len,
                 skip_first=skip_first,
+                layerwise=layerwise,
             )
         except ValueError as exc:
             logger.warning("  skipping prompt %d: %s", prompt_idx, exc)
