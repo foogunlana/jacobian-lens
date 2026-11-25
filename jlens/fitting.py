@@ -106,6 +106,7 @@ def jacobian_for_prompt(
     dim_batch: int = 8,
     max_seq_len: int = 128,
     skip_first: int = SKIP_FIRST_N_POSITIONS,
+    layerwise: bool = False,
 ) -> tuple[dict[int, torch.Tensor], int, int]:
     """Compute the per-layer Jacobian estimator ``J_l`` for one prompt.
 
@@ -130,11 +131,19 @@ def jacobian_for_prompt(
             backward FLOPs are unchanged.
         max_seq_len: Truncate the prompt to this many tokens.
         skip_first: Leading positions to exclude; see :func:`valid_position_mask`.
+        layerwise: If ``True``, compute single-block Jacobians instead:
+            ``A_l = dh_{l+1} / dh_l`` for each source layer ``l`` (same
+            estimator, target ``l + 1``), all from the same backward passes, by
+            cutting the residual stream after every block
+            (``ActivationRecorder(cut_every_block=True)``). ``target_layer``
+            must be ``None``.
 
     Returns:
         ``(jacobians, seq_len, n_valid_positions)``. ``jacobians`` maps each
         source layer to a ``[d_model, d_model]`` fp32 CPU tensor.
     """
+    if layerwise and target_layer is not None:
+        raise ValueError("layerwise targets l + 1 for each source l; don't pass target_layer")
     n_layers, d_model = model.n_layers, model.d_model
     source_layers, target_layer = _check_layer_indices(
         source_layers, target_layer, n_layers
@@ -151,22 +160,31 @@ def jacobian_for_prompt(
     }
     n_passes = math.ceil(d_model / dim_batch)
 
-    with (
-        ActivationRecorder(
+    if layerwise:
+        recorder = ActivationRecorder(model.layers, at=[], cut_every_block=True)
+    else:
+        recorder = ActivationRecorder(
             model.layers,
             at=[*source_layers, target_layer],
             start_graph_at=min(source_layers),
-        ) as recorder,
+        )
+    with (
+        recorder,
         torch.enable_grad(),
     ):
         # One forward on the prompt replicated dim_batch times. The retained
         # graph is reused for every backward pass below.
         replicated_ids = input_ids.expand(dim_batch, -1)
         model.forward(replicated_ids)
-        target_activation = recorder.activations[
-            target_layer
-        ]  # [dim_batch, seq_len, d_model]
-        source_activations = [recorder.activations[layer] for layer in source_layers]
+        if layerwise:
+            # hop l: from the leaf that block l + 1 received to block l + 1's
+            # output. Cut graphs, so each leaf only gets its own hop's gradient.
+            target_activations = [recorder.activations[layer + 1] for layer in source_layers]
+            source_activations = [recorder.leaves[layer] for layer in source_layers]
+        else:
+            target_activations = [recorder.activations[target_layer]]
+            source_activations = [recorder.activations[layer] for layer in source_layers]
+        target_activation = target_activations[0]  # [dim_batch, seq_len, d_model]
 
         valid_positions = position_mask.nonzero(as_tuple=True)[0].to(
             target_activation.device
@@ -185,9 +203,10 @@ def jacobian_for_prompt(
                 dim_start + batch_indices[:n_dims_this_pass, None],
             ] = 1.0
             grads = torch.autograd.grad(
-                outputs=target_activation,
+                outputs=target_activations,
                 inputs=source_activations,
-                grad_outputs=cotangent,
+                # the same one-hot at every target (moved if the model is split across devices)
+                grad_outputs=[cotangent.to(t.device) for t in target_activations],
                 retain_graph=(pass_idx < n_passes - 1),
             )
             for layer, grad in zip(source_layers, grads, strict=True):
