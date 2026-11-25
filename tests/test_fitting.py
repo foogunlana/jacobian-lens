@@ -395,3 +395,22 @@ def test_fit_resume_refuses_the_other_kind_of_checkpoint(tmp_path):
     torch.save(state, j_ckpt)
     with pytest.raises(ValueError, match="layerwise"):
         fit(model, prompts, dim_batch=4, max_seq_len=64, checkpoint_path=j_ckpt, layerwise=True)
+
+
+def test_product_of_hops_is_the_jacobian_when_blocks_are_linear_and_per_position():
+    """Chain rule check: J_l == A_{n-2} @ ... @ A_l.
+
+    Exact here only because the tiny blocks are linear (Jacobian independent of
+    the input, so averaging commutes with the product) and don't mix positions.
+    On a real model the collapsed A's don't multiply back to J exactly; the gap
+    measures context dependence and position mixing.
+    """
+    model = _frozen_tiny(n_layers=5)
+    prompt = "the quick brown fox " * 4
+    J, _, _ = jacobian_for_prompt(model, prompt, [0, 1, 2, 3], dim_batch=4, max_seq_len=64)
+    A, _, _ = jacobian_for_prompt(model, prompt, [0, 1, 2, 3], dim_batch=4, max_seq_len=64, layerwise=True)
+    product = A[3]
+    for layer in [3, 2, 1, 0]:
+        if layer < 3:
+            product = product @ A[layer]
+        torch.testing.assert_close(J[layer], product, rtol=0, atol=1e-5)
