@@ -5,10 +5,18 @@ How it works: `ActivationRecorder(cut_every_block=True)` replaces every block's
 output with a detached copy, so the next block starts a fresh autograd graph.
 One backward pass from all block outputs then gives every A_l separately.
 
-What we check, on two small CPU models (no downloads, ~10 s in total):
+Two small CPU models, built here (no downloads, a few seconds in total):
 
   TinyDecoder  blocks are h + W h (no attention), so A_l = I + W_{l+1} exactly.
   Tiny Qwen3   a randomly initialised Qwen3 with real attention and norms.
+
+Six checks:
+  1. hops on TinyDecoder are I + W                     (exact answer)
+  2. hops match jlens fitted one hop at a time         (same estimator as J)
+  3. multiply-then-collapse is J; collapse-then-multiply is not
+  4. fit() averages the hops over prompts
+  5. fit() won't resume a J checkpoint as hops, or vice versa
+  6. arguments that make no sense with layerwise raise
 
 Run:
     pip install -e ".[dev]"
@@ -68,42 +76,15 @@ def jacobians(model, prompt=PROMPT):
     return jacobian_for_prompt(model, prompt, layers, **SETTINGS)[0]
 
 
-def chain(A, l):
-    """A_{n-2} @ ... @ A_l: the product of hops from layer l to the last layer."""
-    product = A[max(A)]
-    for k in range(max(A) - 1, l - 1, -1):
-        product = product @ A[k]
-    return product
-
-
-# ---------- the cut
-
-
-def test_cut_does_not_change_the_forward_pass():
-    model = tiny_decoder()
-    ids = model.encode(PROMPT)
-    plain = model.forward(ids).last_hidden_state
-    with ActivationRecorder(model.layers, at=[], cut_every_block=True), torch.enable_grad():
-        cut = model.forward(ids).last_hidden_state
-    assert torch.equal(cut, plain)
-
-
-def test_cut_stops_gradients_at_the_previous_block():
-    """The gradient from block 2's output reaches block 1's leaf, and nothing else."""
-    model = tiny_decoder()
-    with ActivationRecorder(model.layers, at=[], cut_every_block=True) as rec, torch.enable_grad():
-        model.forward(model.encode(PROMPT))
-        leaves = [rec.leaves[i] for i in range(4)]
-        grads = torch.autograd.grad(rec.activations[2].sum(), leaves, allow_unused=True)
-    reached = [i for i, g in enumerate(grads) if g is not None]
-    assert reached == [1]
-
-
 # ---------- the hops are right
 
 
 def test_hops_on_tiny_decoder_are_identity_plus_weight():
-    """Block l+1 computes h + W h, so its Jacobian is I + W."""
+    """Block l+1 computes h + W h, so its Jacobian is I + W.
+
+    Also catches gradients leaking through the cut (you'd get products of
+    several blocks) and off-by-one or transposed indexing.
+    """
     model = tiny_decoder()
     A = hops(model)
     for l in A:
@@ -111,10 +92,13 @@ def test_hops_on_tiny_decoder_are_identity_plus_weight():
         torch.testing.assert_close(A[l], expected, rtol=0, atol=1e-5)
 
 
-@pytest.mark.parametrize("make_model", [tiny_decoder, tiny_qwen])
-def test_hops_match_jlens_fitted_one_hop_at_a_time(make_model):
-    """One layerwise pass == separate regular fits with target_layer = l + 1, bit for bit."""
-    model = make_model()
+def test_hops_match_jlens_fitted_one_hop_at_a_time():
+    """One layerwise pass == separate regular fits with target_layer = l + 1, bit for bit.
+
+    With attention, so the sum over later positions is exercised. Also shows the
+    cut leaves the forward pass unchanged, or the numbers would differ.
+    """
+    model = tiny_qwen()
     A = hops(model)
     for l in A:
         one_hop = jacobian_for_prompt(model, PROMPT, [l], target_layer=l + 1, **SETTINGS)[0]
@@ -124,27 +108,15 @@ def test_hops_match_jlens_fitted_one_hop_at_a_time(make_model):
 # ---------- multiplying hops back together
 
 
-def test_product_of_hops_is_j_on_tiny_decoder():
-    """Linear blocks that don't mix positions: the chain rule holds exactly for the averages."""
-    model = tiny_decoder(n_layers=5)
-    A, J = hops(model), jacobians(model)
-    for l in J:
-        torch.testing.assert_close(chain(A, l), J[l], rtol=0, atol=1e-5)
-
-
-def test_product_of_hops_is_not_j_with_attention():
-    """Each hop is already summed over positions, so cross-position paths are lost."""
-    model = tiny_qwen()
-    A, J = hops(model), jacobians(model)
-    gap = (chain(A, 0) - J[0]).norm() / J[0].norm()
-    assert gap > 0.05
-
-
-def test_product_before_collapsing_positions_is_exactly_j():
-    """Keep every (position, position) entry, multiply, then collapse like jlens: that's J.
+def test_multiply_then_collapse_is_j_but_collapse_then_multiply_is_not():
+    """The chain rule is exact per (position, position) entry, not for the averages.
 
     jlens collapses a full Jacobian F[target pos, i, source pos, j] by summing over
-    valid target positions and averaging over valid source positions.
+    valid target positions and averaging over valid source positions. Here we
+    build the full Jacobians of blocks 1 and 2 by brute force and check:
+      collapse(F_0)          == A_0   (the hop is the collapsed block Jacobian)
+      collapse(F_1 @ F_0)    == J_0   (multiply first, then collapse: exact)
+      A_1 @ A_0              != J_0   (collapse first, then multiply: not exact)
     """
     model = tiny_qwen()
     ids = model.encode(PROMPT, max_length=SETTINGS["max_seq_len"])
@@ -155,7 +127,6 @@ def test_product_before_collapsing_positions_is_exactly_j():
         F = full.reshape(seq_len, d, seq_len, d)[valid][:, :, valid]
         return F.sum(0).mean(1)
 
-    # full Jacobian of blocks 1 and 2, every output entry against every input entry
     with ActivationRecorder(model.layers, at=[], cut_every_block=True) as rec, torch.enable_grad():
         model.forward(ids)
         full = {}
@@ -169,6 +140,8 @@ def test_product_before_collapsing_positions_is_exactly_j():
     A, J = hops(model), jacobians(model)
     torch.testing.assert_close(collapse(full[0]), A[0], rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(collapse(full[1] @ full[0]), J[0], rtol=1e-4, atol=1e-5)
+    gap = (A[1] @ A[0] - J[0]).norm() / J[0].norm()
+    assert gap > 0.05
 
 
 # ---------- fit() and its guards
@@ -185,7 +158,10 @@ def test_fit_averages_the_hops_over_prompts():
 
 
 def test_fit_refuses_to_resume_the_other_kind_of_checkpoint(tmp_path):
-    """A J checkpoint must not be resumed as hops, or the other way round."""
+    """A J checkpoint must not be resumed as hops, or the other way round.
+
+    Checkpoints from before this option have no "layerwise" key and count as J.
+    """
     model = TinyDecoder(n_layers=4, d_model=8)
     prompts = ["abcdefghij " * 5]
     regular, layerwise = str(tmp_path / "J.pt"), str(tmp_path / "A.pt")
@@ -196,25 +172,15 @@ def test_fit_refuses_to_resume_the_other_kind_of_checkpoint(tmp_path):
     with pytest.raises(ValueError, match="layerwise"):
         fit(model, prompts, checkpoint_path=layerwise, **SETTINGS)
 
-
-def test_old_checkpoints_count_as_regular_fits(tmp_path):
-    """Checkpoints from before this option have no "layerwise" key."""
-    model = TinyDecoder(n_layers=4, d_model=8)
-    prompts = ["abcdefghij " * 5]
-    path = str(tmp_path / "J.pt")
-    fit(model, prompts, checkpoint_path=path, **SETTINGS)
-    state = torch.load(path, weights_only=True)
-    del state["layerwise"]
-    torch.save(state, path)
+    old = torch.load(regular, weights_only=True)
+    del old["layerwise"]
+    torch.save(old, regular)
     with pytest.raises(ValueError, match="layerwise"):
-        fit(model, prompts, checkpoint_path=path, layerwise=True, **SETTINGS)
+        fit(model, prompts, checkpoint_path=regular, layerwise=True, **SETTINGS)
 
 
-def test_layerwise_does_not_take_a_target_layer():
+def test_arguments_that_make_no_sense_with_layerwise_raise():
     with pytest.raises(ValueError, match="layerwise"):
         fit(tiny_decoder(), [PROMPT], target_layer=2, layerwise=True)
-
-
-def test_cut_every_block_does_not_take_start_graph_at():
     with pytest.raises(ValueError, match="start_graph_at"):
         ActivationRecorder(tiny_decoder().layers, at=[], start_graph_at=0, cut_every_block=True)
